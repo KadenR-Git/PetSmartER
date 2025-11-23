@@ -4,6 +4,21 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <Adafruit_GPS.h>
+#include <Adafruit_PMTK.h>   // PMTK constants for GPS
+#include <SoftwareSerial.h>  // for GPS on D0/D1
+
+// --- compatibility aliases (RA4M1 has no D0..D10 symbols) ---
+#define D0 0
+#define D1 1
+#define D2 2
+#define D3 3
+#define D4 4
+#define D5 5
+#define D6 6
+#define D7 7
+#define D8 8
+#define D9 9
+#define D10 10
 
 // pinout
 #define LORA_CS     D7   // CS / NSS
@@ -29,13 +44,13 @@ const uint32_t LORA_RX_WAIT_MS   = 2000;
 const uint32_t POST_SLEEP_MS     = 171000; // use smaller for testing
 
 // GPS object
-#define GPSSerial Serial1
+SoftwareSerial GPSSerial(GPS_RX, GPS_TX);
 Adafruit_GPS GPS(&GPSSerial);
 
-// RA-FSP hook (optional). If you link RA-FSP LPM, define RA4M1_LPM_LINKED.
-extern "C" void ra4m1_enter_low_power(uint32_t ms);
+// Optional RA-FSP hook — comment out if not linked
+// extern "C" void ra4m1_enter_low_power(uint32_t ms);
 
-// -------- forward ----------
+// -------- forward declarations ----------
 void powerOnGPS();
 void powerOffGPS();
 void powerOnRadio();
@@ -93,7 +108,7 @@ void loop() {
   powerOffRadio();
   powerOffGPS();
 
-  // sleep (RA-FSP hook if linked, otherwise WFI fallback)
+  // sleep
   enterDeepSleep(POST_SLEEP_MS);
 }
 
@@ -110,7 +125,7 @@ void powerOnGPS() {
 }
 
 void powerOffGPS() {
-  GPSSerial.end();
+  GPSSerial.read();
   digitalWrite(GPS_EN_PIN, LOW);
   delay(5);
   Serial.println(F("gps off"));
@@ -120,12 +135,8 @@ void powerOnRadio() {
   digitalWrite(RADIO_EN_PIN, HIGH);
   delay(25);
 
-  // try to bind SPI to these pins so core picks right SERCOM; if core doesn't support, fallback to SPI.begin()
-  #if defined(SPI_HAS_TRANSACTION) && defined(SPI_BEGIN_WITH_PINS)
-    SPI.begin(LORA_SCK, LORA_MOSI, LORA_MISO);
-  #else
-    SPI.begin();
-  #endif
+  // initialize SPI for LoRa
+  SPI.begin();
 
   // pin sanity
   pinMode(LORA_SCK, OUTPUT);
@@ -173,7 +184,12 @@ bool getGpsFix(float &outLat, float &outLon) {
   while (GPSSerial.available()) GPSSerial.read(); // flush
   while (millis() - t0 < GPS_COLLECTION_MS) {
     while (GPSSerial.available()) {
-      GPS.encode((char)GPSSerial.read());
+      char c = GPS.read();        // read one character from GPS
+      if (GPS.newNMEAreceived()) { // a complete NMEA sentence was received
+        if (!GPS.parse(GPS.lastNMEA())) {
+          // failed to parse NMEA, can safely ignore
+        }
+      }
     }
     if (GPS.fix && GPS.latitude != 0.0 && GPS.longitude != 0.0) {
       outLat = GPS.latitudeDegrees;
@@ -182,7 +198,11 @@ bool getGpsFix(float &outLat, float &outLon) {
     }
     delay(10);
   }
-  if (GPS.fix) { outLat = GPS.latitudeDegrees; outLon = GPS.longitudeDegrees; return true; }
+  if (GPS.fix) {
+    outLat = GPS.latitudeDegrees;
+    outLon = GPS.longitudeDegrees;
+    return true;
+  }
   return false;
 }
 
@@ -227,10 +247,10 @@ void sendPacketWithRetry(const String &payload) {
 // -------- deep sleep (WFI fallback) --------
 void enterDeepSleep(uint32_t ms)
 {
-  #ifdef RA4M1_LPM_LINKED
-    ra4m1_enter_low_power(ms);
-    return;
-  #endif
+#ifdef RA4M1_LPM_LINKED
+  ra4m1_enter_low_power(ms);
+  return;
+#endif
 
   // make sure pins won't back-feed powered-down modules
   pinMode(LORA_CS, INPUT);
@@ -246,29 +266,26 @@ void enterDeepSleep(uint32_t ms)
 
   unsigned long start = millis();
 
-  // request deep sleep if core supports it
-  #if defined(SCB) && defined(SCB_SCR_SLEEPDEEP_Msk)
-    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
-  #endif
+#if defined(SCB) && defined(SCB_SCR_SLEEPDEEP_Msk)
+  SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+#endif
 
   while (ms == 0 || (millis() - start < ms)) {
-    __enable_irq();
-    // dsb/isb before wfi
-    #if defined(__DSB) && defined(__ISB)
-      __DSB();
-      __ISB();
-    #else
-      __asm__ volatile ("dsb");
-      __asm__ volatile ("isb");
-    #endif
-    __WFI();
+    interrupts();
+#if defined(__DSB) && defined(__ISB)
+    __DSB();
+    __ISB();
+#else
+    __asm__ volatile ("dsb");
+    __asm__ volatile ("isb");
+#endif
+    delay(1);
     if (ms != 0 && (millis() - start >= ms)) break;
-    // otherwise re-enter
   }
 
-  #if defined(SCB) && defined(SCB_SCR_SLEEPDEEP_Msk)
-    SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
-  #endif
+#if defined(SCB) && defined(SCB_SCR_SLEEPDEEP_Msk)
+  SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
+#endif
 
   delay(10); // settle after wake
 }
